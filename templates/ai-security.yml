@@ -1,15 +1,9 @@
 spec:
   component: [version]
   inputs:
-    repository-url:
-      description: "Optional HTTPS Git repository URL to scan instead of the current checkout. Public hosts are allowlisted by default; never embed credentials."
-      default: ""
     branch:
       description: "Optional branch to scan on the target public repository. If blank, Git uses its default branch."
       default: ""
-    engine-image:
-      description: "Base image path published by the AIShield Scanner project (the component version is appended)."
-      default: "registry.gitlab.com/trisai-secure/eagleshield/engine"
     stage:
       description: "Existing GitLab pipeline stage in which AIShield runs."
       default: test
@@ -17,7 +11,7 @@ spec:
 ai-security:scan:
   stage: $[[ inputs.stage ]]
   image:
-    name: "$[[ inputs.engine-image ]]:$[[ component.version ]]"
+    name: "registry.gitlab.com/trisai-secure/eagleshield/engine:$[[ component.version ]]"
     entrypoint: [""]
   # If DAST is enabled, wait for its job and merge its normalized/raw reports into
   # the final report bundle. The dependency is optional when DAST is disabled.
@@ -26,7 +20,7 @@ ai-security:scan:
       artifacts: true
       optional: true
   variables:
-    AISECURITY_REPOSITORY_URL: "$[[ inputs.repository-url ]]"
+    AISECURITY_REPOSITORY_URL: "$CI_PROJECT_URL"
     AISECURITY_BRANCH: "$[[ inputs.branch ]]"
     AISECURITY_REPORT_DIR: "aishield-reports"
     AISECURITY_UPLOAD_REQUIRED: "true"
