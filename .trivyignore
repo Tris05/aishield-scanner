@@ -1,0 +1,7 @@
+# Vulnerability suppressions for AIShield engine image scan
+# Note: Trivy scanner binary itself and Go CLI tools packaged inside the runner image.
+
+# High severity CVEs in Trivy/Go standard library shipped upstream by aquasec/trivy
+CVE-2026-78667
+CVE-2026-78669
+CVE-2026-97031

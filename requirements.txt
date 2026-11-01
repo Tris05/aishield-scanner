@@ -1,0 +1,11 @@
+# Direct dependencies are pinned. For a production release, generate a complete hash-locked
+# transitive dependency lock with pip-compile --generate-hashes and build with --require-hashes.
+semgrep==1.180.0
+bandit==1.9.4
+pip-audit==2.10.1
+modelscan[h5py]==0.8.8
+detect-secrets==1.5.0
+requests==2.34.2
+packaging==26.0
+garak==0.17.1
+python-dotenv==1.1.1

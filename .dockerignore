@@ -1,0 +1,13 @@
+.git
+.gitlab
+.venv
+venv
+node_modules
+__pycache__
+*.pyc
+aishield-reports
+.env
+.env.*
+*.pem
+*.key
+.aishield-target-*/

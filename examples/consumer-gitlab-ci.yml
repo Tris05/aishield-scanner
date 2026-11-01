@@ -1,0 +1,15 @@
+# Copy/merge this into a consumer project's .gitlab-ci.yml.
+# AIShield scans on this project's GitLab Runner; the target repository can be public GitHub or GitLab.
+stages: [build, test, deploy]
+
+include:
+  - component: $CI_SERVER_FQDN/<namespace>/aishield-scanner/ai-security@0.1.0
+    inputs:
+      repository-url: "https://github.com/OWNER/REPOSITORY"
+      # Omit branch to use the target repository's default branch.
+      branch: "main"
+      engine-image: "registry.gitlab.com/<namespace>/aishield-scanner/engine"
+
+# Add these as masked CI/CD variables in the consuming GitLab project:
+# AISECURITY_DASHBOARD_URL = https://<your-dashboard-backend>
+# AISECURITY_UPLOAD_TOKEN = same secret as backend AISHIELD_INGEST_TOKEN

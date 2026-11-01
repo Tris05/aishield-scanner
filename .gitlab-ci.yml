@@ -1,0 +1,529 @@
+stages:
+  - target_scan
+  - validate
+  - build
+  - image_scan
+  - release
+
+variables:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_INPUT: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  BUILDKITD_FLAGS: "--oci-worker-no-process-sandbox"
+  TRIVY_VERSION: "0.75.0"
+
+
+# Triggered by the dashboard after a remediation branch is pushed. This job runs on the
+# GitLab runner using the published scanner engine image; no hosted scanning worker is used.
+scan-requested-public-repository:
+  stage: target_scan
+  image:
+    name: "$AISECURITY_ENGINE_IMAGE"
+    entrypoint: [""]
+  rules:
+    - if: '$AISECURITY_TRIGGERED_SCAN == "true"'
+    - when: never
+  script:
+    - |
+      set -eu
+      export AISECURITY_REPOSITORY_URL="${AISECURITY_REPOSITORY_URL:?repository URL is required}"
+      export AISECURITY_BRANCH="${AISECURITY_BRANCH:-}"
+      export AISECURITY_REPORT_DIR="aishield-reports"
+      TARGET_PATH="$(python -m aishield.intake)"
+      export AISECURITY_REPO="$TARGET_PATH"
+      set +e
+      python -m aishield.pipeline
+      scan_rc=$?
+      python -m aishield.uploader --required
+      upload_rc=$?
+      set -e
+      if [ "$upload_rc" -ne 0 ] && [ "$scan_rc" -eq 0 ]; then scan_rc=3; fi
+      exit "$scan_rc"
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - aishield-reports/
+  timeout: 45m
+  interruptible: true
+
+# --------------------------------------------------
+# Stage 1: Validate application, tests, benchmark and YAML
+# --------------------------------------------------
+validate-python:
+  stage: validate
+
+  image:
+    name: python:3.12.15-slim-trixie
+    entrypoint: [""]
+
+  script:
+    - python -m compileall -q aishield tests
+    - python -m pip install --no-cache-dir -r requirements.txt
+    - python -m unittest discover -s tests -v
+    - python -m aishield.benchmark
+    - python -m pip install --no-cache-dir yamllint==1.37.1
+    - yamllint -c .yamllint templates/ai-security.yml rules/ai-security.yml .gitlab-ci.yml
+
+
+  rules:
+    - if: '$AISECURITY_TRIGGERED_SCAN == "true"'
+      when: never
+    - when: on_success
+
+# --------------------------------------------------
+# Stage 2: Build and push the scanner engine image
+# --------------------------------------------------
+build-and-push-engine:
+  stage: build
+
+  image:
+    name: moby/buildkit:v0.23.2-rootless
+    entrypoint: [""]
+
+  before_script:
+    - |
+      set -eu
+
+      : "${CI_REGISTRY:?Container Registry is not configured}"
+      : "${CI_REGISTRY_IMAGE:?Registry image path is missing}"
+      : "${CI_REGISTRY_USER:?Registry username is missing}"
+      : "${CI_REGISTRY_PASSWORD:?Registry password is missing}"
+
+      mkdir -p "${HOME}/.docker"
+
+      AUTH="$(printf '%s:%s' \
+        "${CI_REGISTRY_USER}" \
+        "${CI_REGISTRY_PASSWORD}" |
+        base64 | tr -d '\n')"
+
+      printf '{"auths":{"%s":{"auth":"%s"}}}\n' \
+        "${CI_REGISTRY}" "${AUTH}" \
+        > "${HOME}/.docker/config.json"
+
+  script:
+    - |
+      set -eu
+
+      IMAGE_TAG="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+      IMAGE_NAME="${CI_REGISTRY_IMAGE}/engine:${IMAGE_TAG}"
+
+      echo "Building AIShield engine: ${IMAGE_NAME}"
+
+      buildctl-daemonless.sh build \
+        --progress=plain \
+        --frontend dockerfile.v0 \
+        --local context=. \
+        --local dockerfile=. \
+        --output "type=image,name=${IMAGE_NAME},push=true"
+
+      echo "Build and push completed: ${IMAGE_NAME}"
+
+  after_script:
+    - rm -f "${HOME}/.docker/config.json"
+
+  rules:
+    - if: '$AISECURITY_TRIGGERED_SCAN == "true"'
+      when: never
+    # Version-tag builds run automatically.
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+
+    # Optional manual build on the default branch.
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
+
+# --------------------------------------------------
+# Stage 3: Scan image and generate CycloneDX SBOM
+# --------------------------------------------------
+scan-engine-image:
+  stage: image_scan
+  # Intentional: this scans AIShield's own engine image, not the target repository.
+  # Keep self-release non-blocking; target-repository policy is enforced by the component job.
+  allow_failure: true
+
+  image:
+    name: python:3.12.15-slim-trixie
+    entrypoint: [""]
+
+  variables:
+    TRIVY_USERNAME: "$CI_REGISTRY_USER"
+    TRIVY_PASSWORD: "$CI_REGISTRY_PASSWORD"
+
+  before_script:
+    - |
+      set -eu
+
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        ca-certificates curl tar gzip
+      rm -rf /var/lib/apt/lists/*
+
+      cd /tmp
+
+      TRIVY_ARCHIVE="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+      TRIVY_CHECKSUMS="trivy_${TRIVY_VERSION}_checksums.txt"
+      TRIVY_URL="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+
+      echo "Downloading Trivy ${TRIVY_VERSION}..."
+
+      curl -fsSLo "${TRIVY_ARCHIVE}" \
+        "${TRIVY_URL}/${TRIVY_ARCHIVE}"
+
+      curl -fsSLo "${TRIVY_CHECKSUMS}" \
+        "${TRIVY_URL}/${TRIVY_CHECKSUMS}"
+
+      # Require an exact checksum entry for the downloaded archive.
+      if ! CHECKSUM_LINE="$(awk \
+        -v file="${TRIVY_ARCHIVE}" \
+        '$NF == file || $NF == ("*" file) {
+          print
+          found = 1
+        }
+        END {
+          if (!found) exit 1
+        }' "${TRIVY_CHECKSUMS}")"; then
+        echo "ERROR: Trivy archive checksum entry not found."
+        exit 1
+      fi
+
+      printf '%s\n' "${CHECKSUM_LINE}" | sha256sum -c -
+
+      tar -xzf "${TRIVY_ARCHIVE}" trivy
+      install -m 0755 trivy /usr/local/bin/trivy
+
+      trivy --version
+
+      cd "${CI_PROJECT_DIR}"
+
+  script:
+    - |
+      set -eu
+
+      mkdir -p aishield-reports
+
+      IMAGE_NAME="${CI_REGISTRY_IMAGE}/engine:${CI_COMMIT_TAG}"
+      VULN_REPORT="aishield-reports/engine-vulnerabilities.json"
+      SBOM_REPORT="aishield-reports/engine-sbom.cdx.json"
+
+      echo "Scanning image: ${IMAGE_NAME}"
+
+      # --------------------------------------------------
+      # Vulnerability scan
+      # --------------------------------------------------
+      # Findings alone do not determine the Trivy exit status.
+      # Operational failures are captured separately.
+      set +e
+
+      if [ -f .trivyignore ]; then
+        trivy image \
+          --quiet \
+          --ignorefile .trivyignore \
+          --scanners vuln \
+          --severity HIGH,CRITICAL \
+          --exit-code 0 \
+          --format json \
+          --output "${VULN_REPORT}" \
+          "${IMAGE_NAME}"
+      else
+        trivy image \
+          --quiet \
+          --scanners vuln \
+          --severity HIGH,CRITICAL \
+          --exit-code 0 \
+          --format json \
+          --output "${VULN_REPORT}" \
+          "${IMAGE_NAME}"
+      fi
+
+      VULN_STATUS=$?
+
+      # --------------------------------------------------
+      # SBOM generation
+      # --------------------------------------------------
+      # Always attempt this independently of the first result.
+      echo "Generating CycloneDX SBOM..."
+
+      trivy image \
+        --quiet \
+        --format cyclonedx \
+        --output "${SBOM_REPORT}" \
+        "${IMAGE_NAME}"
+
+      SBOM_STATUS=$?
+
+      set -e
+
+      export VULN_STATUS SBOM_STATUS VULN_REPORT SBOM_REPORT
+
+      # --------------------------------------------------
+      # Validate reports and enforce the security gate
+      # Exit 0 = pass
+      # Exit 1 = HIGH/CRITICAL policy violation
+      # Exit 2 = operational error or invalid report
+      # --------------------------------------------------
+      python - <<'PY'
+      import json
+      import os
+      import sys
+      from pathlib import Path
+
+      vuln_path = Path(os.environ["VULN_REPORT"])
+      sbom_path = Path(os.environ["SBOM_REPORT"])
+      vuln_status = int(os.environ["VULN_STATUS"])
+      sbom_status = int(os.environ["SBOM_STATUS"])
+
+      operational_errors = []
+      critical = 0
+      high = 0
+
+      if vuln_status != 0:
+          operational_errors.append(
+              f"Trivy vulnerability scan failed operationally "
+              f"(exit {vuln_status})."
+          )
+
+      if sbom_status != 0:
+          operational_errors.append(
+              f"Trivy SBOM generation failed (exit {sbom_status})."
+          )
+
+      # Check that both reports exist and contain data.
+      for path in (vuln_path, sbom_path):
+          if not path.is_file() or path.stat().st_size == 0:
+              operational_errors.append(
+                  f"Required report is missing or empty: {path}"
+              )
+
+      # Validate vulnerability report structure and count findings.
+      if vuln_path.is_file() and vuln_path.stat().st_size:
+          try:
+              report = json.loads(
+                  vuln_path.read_text(encoding="utf-8")
+              )
+
+              if not isinstance(report, dict):
+                  raise ValueError(
+                      "Vulnerability report root is not an object"
+                  )
+
+              if "Results" not in report:
+                  raise ValueError(
+                      "Trivy report is missing Results"
+                  )
+
+              results = report["Results"]
+
+              if not isinstance(results, list):
+                  raise ValueError(
+                      "Trivy Results field is not a list"
+                  )
+
+              for result in results:
+                  if not isinstance(result, dict):
+                      raise ValueError(
+                          "Trivy result entry is not an object"
+                      )
+
+                  vulnerabilities = (
+                      result.get("Vulnerabilities") or []
+                  )
+
+                  if not isinstance(vulnerabilities, list):
+                      raise ValueError(
+                          "Trivy Vulnerabilities field is not a list"
+                      )
+
+                  for item in vulnerabilities:
+                      if not isinstance(item, dict):
+                          raise ValueError(
+                              "Trivy vulnerability entry is not an object"
+                          )
+
+                      severity = (
+                          item.get("Severity") or ""
+                      ).upper()
+
+                      if severity == "CRITICAL":
+                          critical += 1
+                      elif severity == "HIGH":
+                          high += 1
+
+          except (
+              json.JSONDecodeError,
+              OSError,
+              ValueError,
+              AttributeError,
+              TypeError,
+          ) as exc:
+              operational_errors.append(
+                  f"Cannot validate Trivy vulnerability JSON: {exc}"
+              )
+
+      # Validate the CycloneDX SBOM.
+      if sbom_path.is_file() and sbom_path.stat().st_size:
+          try:
+              sbom = json.loads(
+                  sbom_path.read_text(encoding="utf-8")
+              )
+
+              if not isinstance(sbom, dict):
+                  raise ValueError(
+                      "SBOM root is not an object"
+                  )
+
+              if sbom.get("bomFormat") != "CycloneDX":
+                  raise ValueError(
+                      "SBOM is not CycloneDX format"
+                  )
+
+              if (
+                  "components" in sbom
+                  and not isinstance(sbom["components"], list)
+              ):
+                  raise ValueError(
+                      "SBOM components field is not a list"
+                  )
+
+          except (
+              json.JSONDecodeError,
+              OSError,
+              ValueError,
+              TypeError,
+          ) as exc:
+              operational_errors.append(
+                  f"Cannot validate CycloneDX SBOM: {exc}"
+              )
+
+      print(f"Critical vulnerability occurrences: {critical}")
+      print(f"High vulnerability occurrences: {high}")
+      print(
+          "INFO: Debian OS-package findings may have no fix available "
+          "in the current Debian release. Check the Debian Security Tracker "
+          "before attempting package upgrades."
+      )
+
+      if operational_errors:
+          print("RESULT: OPERATIONAL ERROR / SCAN INCOMPLETE")
+          for error in operational_errors:
+              print(f" - {error}")
+          sys.exit(2)
+
+      if critical > 0 or high > 0:
+          print("RESULT: SECURITY POLICY VIOLATION")
+          sys.exit(1)
+
+      print("RESULT: SECURITY GATE PASSED")
+      PY
+
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - aishield-reports/
+
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+# --------------------------------------------------
+# Stage 4: Publish the GitLab release
+# --------------------------------------------------
+create-release:
+  stage: release
+
+  image:
+    name: registry.gitlab.com/gitlab-org/cli:v1.117.0
+    entrypoint: [""]
+
+  needs:
+    - job: build-and-push-engine
+      artifacts: false
+    - job: scan-engine-image
+      artifacts: false
+      optional: true
+
+  script:
+    - |
+      set -eu
+
+      cat > release_description.md <<EOF
+      # AIShield ${CI_COMMIT_TAG} — Release Notes and Usage
+
+      AIShield is a GitLab CI component for security scanning of AI/ML repositories.
+
+      It combines dependency and infrastructure checks, static analysis, secret scanning, model and dataset checks, and optional runtime security tests.
+
+      **Important:** Skipped or failed scanners are not a security pass. No scanner guarantees detection of every vulnerability.
+
+      ## Quick Start
+
+      Add the following configuration to your project's \`.gitlab-ci.yml\`:
+
+      \`\`\`yaml
+      include:
+        - component: ${CI_SERVER_FQDN}/${CI_PROJECT_PATH}/ai-security@${CI_COMMIT_TAG}
+          inputs:
+            repository-url: "https://gitlab.com/your-org/your-ai-repo"
+      \`\`\`
+
+      If AIShield runs directly inside the repository you want to scan, \`repository-url\` can be omitted.
+
+      ## Configure Scan Policy
+
+      Add a \`.config\` file to the root of your target repository to configure scan preferences.
+
+      For example:
+
+      \`\`\`bash
+      AISECURITY_FAIL_ON=high
+      \`\`\`
+
+      If \`.config\` is omitted, AIShield falls back to its built-in default configuration.
+
+      ## Dashboard integration
+
+      The scanner executes on the GitLab runner. It writes JSON, SARIF and Markdown artifacts, then uploads the normalized JSON report to the hosted dashboard when \`AISECURITY_DASHBOARD_URL\` and \`AISECURITY_UPLOAD_TOKEN\` are configured.
+
+      ## Reports
+
+      Generated reports are stored under \`aishield-reports/\`:
+
+      - **Hosted dashboard URL** — Printed by the report upload step when the dashboard integration is configured.
+      - **report.json** — Machine-readable findings.
+      - **report.sarif** — SARIF security report.
+      - **report.md** — Markdown summary.
+      - **artifact-manifest.json** — Manifest of generated reports and raw scanner outputs.
+
+      Report availability depends on the stages executed and their completion status.
+
+      ## Optional Security Testing
+
+      Runtime testing and LLM red teaming may require explicit authorization, configuration, endpoints, or credentials. Consult the setup guides before enabling these capabilities.
+
+      ## Documentation
+
+      - [Main README](${CI_PROJECT_URL}/-/blob/${CI_COMMIT_TAG}/README.md)
+      - [LLM red-teaming guide](${CI_PROJECT_URL}/-/blob/${CI_COMMIT_TAG}/docs/LLM-RED-TEAMING.md)
+      - [DAST setup](${CI_PROJECT_URL}/-/blob/${CI_COMMIT_TAG}/DAST-REDTEAM-SETUP.md)
+      - [Scanner coverage and limitations](${CI_PROJECT_URL}/-/blob/${CI_COMMIT_TAG}/PHASE2-COVERAGE.md)
+      - [Environment template](${CI_PROJECT_URL}/-/blob/${CI_COMMIT_TAG}/.env.example)
+      - [GitLab component template](${CI_PROJECT_URL}/-/blob/${CI_COMMIT_TAG}/templates/ai-security.yml)
+      EOF
+
+      echo "Generated release description:"
+      cat release_description.md
+
+      test -s release_description.md
+
+  release:
+    tag_name: "$CI_COMMIT_TAG"
+    name: "AIShield $CI_COMMIT_TAG"
+    description: "./release_description.md"
+
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+# TODO: Automate semantic version tag creation.
+# Generate and push version tags (MAJOR.MINOR.PATCH) automatically
+# after validation, build, and security scanning succeed.
+# Ensure version bumps follow release rules and prevent duplicate tags.
+# Use a protected CI/CD token with minimum required permissions.
+# Do not create a release tag if the security gate fails.

@@ -1,0 +1,52 @@
+rules:
+  - id: aishield.python.pickle-load
+    languages: [python]
+    severity: ERROR
+    message: "Unsafe pickle deserialization: never deserialize untrusted content."
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-502"
+    pattern-either:
+      - pattern: pickle.load($F, ...)
+      - pattern: pickle.loads($DATA, ...)
+      - pattern: joblib.load($F, ...)
+  - id: aishield.python.dynamic-eval
+    languages: [python]
+    severity: ERROR
+    message: "Dynamic code evaluation can lead to code execution."
+    metadata:
+      category: security
+      confidence: MEDIUM
+      cwe: "CWE-94"
+    pattern-either:
+      - pattern: eval($X, ...)
+      - pattern: exec($X, ...)
+  - id: aishield.python.subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: "subprocess shell=True requires careful review for command injection."
+    metadata:
+      category: security
+      confidence: MEDIUM
+      cwe: "CWE-78"
+    pattern: subprocess.$FUNC(..., shell=True, ...)
+  - id: aishield.python.torch-load-review
+    languages: [python]
+    severity: WARNING
+    message: "Review torch.load usage: use safe loading options where supported and only trusted artifacts."
+    metadata:
+      category: security
+      confidence: LOW
+    pattern: torch.load($PATH, ...)
+  - id: aishield.python.tls-verify-disabled
+    languages: [python]
+    severity: ERROR
+    message: "TLS verification appears to be disabled."
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-295"
+    pattern-either:
+      - pattern: requests.$METHOD(..., verify=False, ...)
+      - pattern: httpx.$METHOD(..., verify=False, ...)

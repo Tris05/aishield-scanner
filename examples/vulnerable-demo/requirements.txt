@@ -1,0 +1,2 @@
+# Intentionally old for exercising dependency scanners in this fixture.
+requests==2.19.0
