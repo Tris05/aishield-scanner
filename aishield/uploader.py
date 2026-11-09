@@ -80,9 +80,17 @@ def upload(required: bool = False) -> dict:
     response.raise_for_status()
     result = response.json()
     dashboard_url = result.get("dashboard_url")
+
+    frontend_url = os.getenv("AISECURITY_FRONTEND_URL", "").strip().rstrip("/")
+
+    if dashboard_url and frontend_url:
+        parsed_url = urlparse(dashboard_url)
+        dashboard_url = f"{frontend_url}{parsed_url.path}"
+
     print("\n[AIShield] Scan report uploaded successfully.")
     if dashboard_url:
         print(f"[AIShield] Dashboard: {dashboard_url}")
+
     return result
 
 
